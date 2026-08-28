@@ -113,6 +113,11 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost as _tool_cost
+except ImportError:  # pragma: no cover
+    TOOL_SPECS, _tool_cost = {}, None
+from agent.strategy import successor_of, cheap_mask, is_catalog_trap
 
 __all__ = [
     "COMMAND_KINDS",
@@ -376,7 +381,10 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        routed = cmd
+        successor = successor_of(cmd.server, cmd.tool)
+        if successor:
+            routed = self._replace(cmd, server=successor[0], tool=successor[1])
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -420,10 +428,34 @@ class Gateway:
         # starter: never rewrites a mask and never paces spend — it trusts
         # the model's own field mask exactly as written, every time.
 
+        spec = TOOL_SPECS.get((routed.server, routed.tool)) if TOOL_SPECS else None
+        if routed.tool == "get_frame" and routed.lease_id not in tuple(getattr(self.ctx, "leases", ()) or ()):
+            return self.deny(cmd, "get_frame requires a live lease")
+        if spec is not None and getattr(spec, "is_write", False):
+            headers = {str(k).lower(): v for k, v in routed.headers.items()}
+            if not headers.get("if-match") or not headers.get("idempotency-key"):
+                return self.deny(cmd, "write requires If-Match and Idempotency-Key")
+            target = routed.args.get("learner") or routed.args.get("learner_id")
+            if target is not None and str(target).casefold() != str(getattr(self.ctx, "act", "")).casefold():
+                return self.deny(cmd, "write target is outside active learner")
+        fields = tuple(routed.fields)
+        if is_catalog_trap(routed.server, routed.tool, fields):
+            fields = ("name",) if routed.tool == "list_servers" else ("term",)
+        if spec is not None and fields == ("*",):
+            fields = tuple(getattr(spec, "default_fields", ()) or ())
+        if fields != routed.fields:
+            routed = self._replace(routed, fields=fields)
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict="rewrite" if routed != cmd else "forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    @staticmethod
+    def _replace(cmd: Command, **changes: Any) -> Command:
+        values = cmd.to_dict()
+        values.update(changes)
+        values["fields"] = tuple(values.get("fields", ()))
+        return Command(**values)
 
     def deny(self, cmd: Command, reason: str) -> Decision:
         """Not called anywhere in this starter's `decide()` — a ready-made

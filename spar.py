@@ -324,7 +324,7 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bot", choices=BOTS, default="rookie")
     ap.add_argument("--as", dest="role", choices=ROLES, default="all")
-    ap.add_argument("--rounds", type=int, default=10)
+    ap.add_argument("--rounds", type=int, default=15)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ui", action="store_true", help="write a run log and print the UI url")
     ap.add_argument("--quiet", action="store_true")
@@ -364,31 +364,66 @@ def main(argv=None) -> int:
         # L1 domain facts from YOUR side's defence, then L2 referee decisions, then L3
         # match state — the layering CONTRACTS.md 5 requires, so the ledger and the UI
         # never read the same event for different purposes.
-        events_for_ui.append({"layer": 1, "type": "exchange_start", "side": "A",
-                              "round": r, "attacker": a.bot, "defender": "you",
-                              "card_id": bot_card.get("id"), "ask": bot_card.get("ask")})
-        for e in d_you["trace"]:
-            if e["type"] in ("command", "enforced", "tool_call", "mutation", "answer",
-                             "integrity"):
-                events_for_ui.append({"layer": 1, "type": e["type"], "side": "A",
-                                      "round": r, **e["p"]})
-        for c in d_you["verified"]:
-            events_for_ui.append({"layer": 2, "type": "claim_outcome", "side": "B",
-                                  "producer": "referee", "round": r, "cls": c["cls"],
-                                  "evidence": c.get("evidence", []), "outcome": "verified",
-                                  "weight": weight_of(c["cls"]),
-                                  "scaled": round(weight_of(c["cls"]) * round_scale(r))})
-        for c in d_bot["false"]:
-            events_for_ui.append({"layer": 2, "type": "claim_outcome", "side": "A",
-                                  "producer": "referee", "round": r, "cls": c["cls"],
-                                  "evidence": c.get("evidence", []), "outcome": "false",
-                                  "weight": weight_of(c["cls"]),
-                                  "scaled": -round(0.8 * weight_of(c["cls"]) * round_scale(r))})
-        for m in d_bot["missed"]:
-            events_for_ui.append({"layer": 2, "type": "latent_violation", "side": "B",
-                                  "producer": "referee", "round": r, "cls": m["cls"],
-                                  "evidence": [f"evt:{m['seq']:04d}"],
-                                  "weight": weight_of(m["cls"])})
+        def add_exchange(result, side, attacker, defender, card):
+            events_for_ui.append({
+                "layer": 1, "type": "exchange_start", "side": side,
+                "round": r, "attacker": attacker, "defender": defender,
+                "card_id": card.get("id"), "ask": card.get("ask"),
+            })
+            for event in result["trace"]:
+                if event["type"] in (
+                    "command", "decision", "enforced", "tool_call", "tool_result",
+                    "mutation", "answer", "integrity",
+                ):
+                    events_for_ui.append({
+                        "layer": 1, "type": event["type"], "side": side,
+                        "round": r, **event["p"],
+                    })
+
+        def add_prosecution(result, prosecutor_side):
+            for outcome in ("verified", "false"):
+                for claim in result[outcome]:
+                    common = {
+                        "cls": claim["cls"],
+                        "evidence": claim.get("evidence", []),
+                        "expected": claim.get("expected"),
+                        "observed": claim.get("observed"),
+                        "argument": claim.get("argument"),
+                    }
+                    events_for_ui.append({
+                        "layer": 2, "type": "claim_filed", "side": prosecutor_side,
+                        "round": r, **common,
+                    })
+                    scale = (1.0 if outcome == "verified" else -0.8) * round_scale(r)
+                    events_for_ui.append({
+                        "layer": 2, "type": "claim_outcome", "side": prosecutor_side,
+                        "producer": "referee", "round": r, **common,
+                        "outcome": outcome, "weight": weight_of(claim["cls"]),
+                        "scaled": round(weight_of(claim["cls"]) * scale),
+                    })
+            for claim in result["pending"]:
+                events_for_ui.append({
+                    "layer": 2, "type": "claim_filed", "side": prosecutor_side,
+                    "round": r, "cls": claim.get("cls"),
+                    "evidence": claim.get("evidence", []),
+                    "expected": claim.get("expected"),
+                    "observed": claim.get("observed"),
+                    "argument": claim.get("argument"),
+                })
+
+        add_exchange(d_you, "A", a.bot, "you", bot_card)
+        add_exchange(d_bot, "B", "you", a.bot, you_card)
+        add_prosecution(d_you, "B")
+        add_prosecution(d_bot, "A")
+
+        for result, examined_side in ((d_you, "A"), (d_bot, "B")):
+            for m in result["missed"]:
+                events_for_ui.append({
+                    "layer": 2, "type": "latent_violation", "side": examined_side,
+                    "producer": "referee", "round": r, "cls": m["cls"],
+                    "evidence": [f"evt:{m['seq']:04d}"],
+                    "weight": weight_of(m["cls"]),
+                })
         events_for_ui.append({"layer": 3, "type": "hp", "producer": "referee",
                               "round": r, "A": hp_you, "B": hp_bot})
         events_for_ui.append({"layer": 3, "type": "round_end", "producer": "referee",

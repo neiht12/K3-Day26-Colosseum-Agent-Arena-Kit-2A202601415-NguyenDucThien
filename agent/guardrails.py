@@ -177,7 +177,17 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    if not isinstance(text, str) or not text:
+        return InjectionScanResult(False, ())
+    lowered = re.sub(r"\s+", " ", text.casefold())
+    patterns = (
+        "ignore previous instruction", "ignore all previous", "disregard the above",
+        "system override", "you must now", "instead, record", "also record this",
+        "reveal the", "print the", "bỏ qua mọi hướng dẫn", "as the system",
+        "new system prompt", "do not tell the user",
+    )
+    hits = tuple(pattern for pattern in patterns if pattern in lowered)
+    return InjectionScanResult(bool(hits), hits)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +215,24 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    if not isinstance(text, str) or not text:
+        return RedactionResult(text, ())
+    # This is deliberately conservative: redact explicit credential/identity
+    # material, while leaving ordinary course prose untouched.  Corpus-private
+    # paragraphs are also caught when callers mark them with the conventional
+    # PRIVATE prefix.
+    patterns = (
+        (r"(?i)\b(?:api[_ -]?key|secret|password|token)\s*[:=]\s*[^\s,;]+", "credential"),
+        (r"(?i)\bprivate\s*:\s*.{40,}", "private-content"),
+        (r"(?i)\b(?:learner|student)\s*id\s*[:=]\s*[A-Za-z0-9:_-]+", "learner-id"),
+    )
+    result = text
+    hits: list[str] = []
+    for pattern, label in patterns:
+        if re.search(pattern, result):
+            result = re.sub(pattern, "[REDACTED]", result)
+            hits.append(label)
+    return RedactionResult(result, tuple(hits))
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +265,17 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
-    return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
-    )
+    if not isinstance(text, str):
+        return ArithmeticCheckResult(True, False, "text is not a string")
+    expressions = re.findall(r"(-?\d+(?:\.\d+)?)\s*([+\-*/])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)", text)
+    if not expressions:
+        return ArithmeticCheckResult(False, None, "no explicit arithmetic expression found")
+    for left, op, right, result in expressions:
+        a, b, expected = map(float, (left, right, result))
+        actual = {"+": a + b, "-": a - b, "*": a * b, "/": a / b if b else float("nan")}[op]
+        if actual != actual or abs(actual - expected) > 1e-9 * max(1.0, abs(actual), abs(expected)):
+            return ArithmeticCheckResult(True, False, f"incorrect expression: {left}{op}{right}={result}")
+    return ArithmeticCheckResult(True, True, f"verified {len(expressions)} arithmetic expression(s)")
 
 
 # ---------------------------------------------------------------------------
